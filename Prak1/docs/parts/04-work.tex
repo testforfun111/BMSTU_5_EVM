@@ -1,0 +1,203 @@
+\chapter{Индивидуальное задание}
+
+Вариант 20: 
+Устройство формирования индексов SQL EXCEPT. Сформировать в хост-подсистеме и передать в SPE 256 записей множества A (случайные числа в диапазое 0..1024) и 256 записей множества B (случайные числа в диапазоне 0..1024). Сформировать в SPE множество C = A not B. Выполнить тестирование работы SPE, сравнив набор ключей в множестве C с ожидаемым.
+
+\chapter{Экспериментальная часть}
+
+
+
+
+\section{Код программного обеспечения}
+
+\subsection{Host}
+
+\begin{lstlisting}[label=lst:host,caption=Измененный код хост-системы под индивидульное задание]
+#include <iostream>
+#include <iterator>
+#include <string>
+#include <regex>
+#include <sstream>
+#include <fstream>
+#include <ctime>
+#include "host_main.h"
+using namespace std;
+
+uint64_t MAX_RECORD = 256;
+uint64_t MAX = 1024;
+
+int main(int argc, char** argv)
+{
+	srand(time(NULL));
+	ofstream log("practicum.log"); //поток вывода сообщений
+	gpc *gpc64_inst; //указатель на класс gpc
+	
+	//Инициализация gpc
+	if (argc<2) 
+	{
+		log<<"Использование: host_main <путь к файлу rawbinary>"<<endl;
+		return -1;
+	}
+	
+	//Захват ядра gpc и запись sw_kernel
+	gpc64_inst = new gpc();
+	log<<"Открывается доступ к "<<gpc64_inst->gpc_dev_path<<endl;
+	if (gpc64_inst->load_swk(argv[1])==0) {
+		log<<"Программное ядро загружено из файла "<<argv[1]<<endl;
+	}
+	else {
+		log<<"Ошибка загрузки sw_kernel файла << argv[1]"<<endl;
+		return -1;
+	}
+	//готов данные
+	uint64_t A[MAX_RECORD];
+	uint64_t B[MAX_RECORD];
+	uint64_t C[MAX_RECORD];
+	ifstream fileA("./test/A");
+	ifstream fileB("./test/B");
+	ifstream fileC("./test/C");
+	uint64_t x;
+	int count = 0;
+	while(fileA >> x)
+	A[count++] = x;
+	count = 0;
+	while(fileB >> x)
+	B[count++] = x;
+	count = 0;
+	while(fileC >> x)
+	C[count++] = x;
+	fileA.close();
+	fileB.close();
+	fileC.close();
+	// Инициализация
+	gpc64_inst->start(__event__(update)); //обработчик вставки 
+	
+	for (uint64_t j = 0; j < MAX_RECORD; j++) 
+	{	
+		gpc64_inst->mq_send(A[j]); 
+	}
+	for (uint64_t j = 0; j < MAX_RECORD; j++) 
+	{	
+		gpc64_inst->mq_send(B[j]); 
+	}
+	//Терминальный символ
+	gpc64_inst->mq_send(-1ull);
+	
+	gpc64_inst->start(__event__(expect_not)); //обработчик запроса not 
+	
+	uint64_t k = gpc64_inst->mq_receive();
+	cout<< k << endl;
+	cout<< gpc64_inst->mq_receive() << endl;
+	cout<< gpc64_inst->mq_receive() << endl;
+	
+	count = 0;
+	int err = 0;
+	while (1) 
+	{
+		uint64_t key = gpc64_inst->mq_receive();
+		if (key == -1ull) break;
+		if (C[count++] != key)
+		err++;
+	}
+	cout << "Ошибок: " << err <<endl;
+	return 0;
+}
+\end{lstlisting}
+
+\subsection{sw\_kernel}
+
+\begin{lstlisting}[label=lst:swkernel,caption=Измененный код sw\_kernel под индивидульное задание]
+#include <stdlib.h>
+#include <ctime>
+#include "lnh64.hxx"
+#include "gpc_io_swk.h"
+#include "gpc_handlers.h"
+// #include "iterators.h"
+// #include "common_struct.h"
+#include "compose_keys.hxx"
+
+#define __fast_recall__
+#define LEFT_STRUCT 1
+#define RIGHT_STRUCT 2
+#define RESULT_STRUCT 4
+#define MAX 256
+
+extern lnh lnh_core;
+volatile unsigned int event_source;
+uint64_t LNH_key;
+int main(void) {
+	/////////////////////////////////////////////////////////
+	//                  Main Event Loop
+	/////////////////////////////////////////////////////////
+	//Leonhard driver structure should be initialised
+	lnh_init();
+	for (;;) {
+		//Wait for event
+		event_source = wait_event();
+		switch(event_source) {
+			/////////////////////////////////////////////
+			//  Measure GPN operation frequency
+			/////////////////////////////////////////////
+			case __event__(update) : update(); break;
+			case __event__(expect_not) : expect_not(); break;
+		}
+		set_gpc_state(READY);
+	}
+}
+
+//-------------------------------------------------------------
+//      Вставка ключа и значения в структуру
+//-------------------------------------------------------------
+
+void update()
+{
+	lnh_del_str_sync(LEFT_STRUCT);
+	lnh_del_str_sync(RIGHT_STRUCT);
+	int count = 0;
+	while(1)
+	{
+		LNH_key = mq_receive();
+		if (LNH_key==-1ull) break;
+		if (count < MAX)
+		lnh_ins_async(LEFT_STRUCT, LNH_key, LNH_key); //Вставка в таблицу с типизацией uint64_t
+		else 
+		{
+			lnh_ins_async(RIGHT_STRUCT, LNH_key, LNH_key); //Вставка в таблицу с типизацией uint64_t
+		}
+		count++;
+	} 
+	
+}
+
+//-------------------------------------------------------------
+//      not
+//-------------------------------------------------------------
+
+void expect_not() 
+{
+	
+	mq_send(lnh_get_num(LEFT_STRUCT));
+	mq_send(lnh_get_num(RIGHT_STRUCT));
+	lnh_not_sync(LEFT_STRUCT, RIGHT_STRUCT, RESULT_STRUCT);
+	mq_send(lnh_get_num(RESULT_STRUCT));
+	
+	uint64_t count = lnh_get_num(RESULT_STRUCT);
+	lnh_get_first(RESULT_STRUCT);
+	for (uint64_t i = 0; i < count; i++)
+	{
+		mq_send(lnh_core.result.key);
+		lnh_next(RESULT_STRUCT, lnh_core.result.key);
+	}
+	mq_send(-1ull);
+	
+}
+
+\end{lstlisting}
+
+\section{Тестирование программного обеспечения}
+
+Тестирование пройдено успешно.
+
+\section{Вывод}
+В ходе практикума было проведено ознакомление с типовой структурой двух взаимодействующих программ: хост-подсистемы и программного ядра sw\_kernel.
+Была разработана программа для хост-подсистемы и обработчика программного ядра, выполняющия действия, описанные в индивидуальном задании
